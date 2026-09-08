@@ -10,8 +10,10 @@ from music_assistant_models.enums import (
     QueueOption,
 )
 from music_assistant_models.errors import UserNotFoundError
-from music_assistant_models.media_items import Track
+from music_assistant_models.media_items import AudioFormat, Radio, Track
 from music_assistant_models.player import PlayerMedia
+from music_assistant_models.queue_item import QueueItem
+from music_assistant_models.streamdetails import StreamDetails, StreamMetadata
 import pytest
 from syrupy.assertion import SnapshotAssertion
 from syrupy.filters import paths
@@ -90,6 +92,7 @@ from homeassistant.setup import async_setup_component
 
 from .common import (
     create_players_from_fixture,
+    load_and_parse_fixture,
     setup_integration_from_fixtures,
     snapshot_music_assistant_entities,
     trigger_subscription_callback,
@@ -1479,3 +1482,124 @@ async def test_media_image_falls_back_to_queue_item(
     assert state.attributes["entity_picture"] == static_image_url
     # Verify the fallback path was actually taken
     music_assistant_client.get_media_item_image_url.assert_called_once()
+
+
+NEXT_ITEM_IMAGE_URL = (
+    "http://mass.local:8095/imageproxy/"
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef?size=512&fmt=png"
+)
+
+
+@pytest.mark.parametrize(
+    ("next_item", "next_media"),
+    [
+        pytest.param(
+            QueueItem(
+                queue_id="test_group_player_1",
+                queue_item_id="next_track",
+                name="Chris Stapleton - Tennessee Whiskey",
+                duration=293,
+                media_item=Track.from_dict(load_and_parse_fixture("library_tracks")[0]),
+            ),
+            PlayerMedia(
+                uri="library://track/456",
+                media_type=MediaType.TRACK,
+                title="Tennessee Whiskey",
+                artist="Chris Stapleton",
+                album="Traveller",
+                image_url=NEXT_ITEM_IMAGE_URL,
+                source_id="test_group_player_1",
+                queue_item_id="next_track",
+            ),
+            id="track",
+        ),
+        pytest.param(
+            QueueItem(
+                queue_id="test_group_player_1",
+                queue_item_id="radio_station",
+                name="fm4 | ORF | HQ",
+                duration=None,
+                media_item=Radio.from_dict(load_and_parse_fixture("library_radios")[0]),
+                streamdetails=StreamDetails(
+                    provider="radiobrowser",
+                    item_id="1",
+                    audio_format=AudioFormat(),
+                    media_type=MediaType.RADIO,
+                    stream_metadata=StreamMetadata(
+                        title="Lay It Down",
+                        artist="Cowboy Junkies",
+                        image_url=NEXT_ITEM_IMAGE_URL,
+                    ),
+                ),
+            ),
+            PlayerMedia(
+                uri="library://radio/1",
+                media_type=MediaType.RADIO,
+                title="Lay It Down",
+                artist="Cowboy Junkies",
+                album="fm4 | ORF | HQ",
+                image_url=NEXT_ITEM_IMAGE_URL,
+                source_id="test_group_player_1",
+                queue_item_id="radio_station",
+            ),
+            id="radio",
+        ),
+    ],
+)
+async def test_media_attributes_and_picture_change_together(
+    hass: HomeAssistant,
+    music_assistant_client: MagicMock,
+    next_item: QueueItem,
+    next_media: PlayerMedia,
+) -> None:
+    """Test media_title and entity_picture always describe the same item.
+
+    The server emits QUEUE_UPDATED before the (debounced) PLAYER_UPDATED that
+    carries the new current_media, so the queue and the player are briefly out
+    of sync. Both attributes must be sourced from the same object so the
+    picture can never lag the title.
+    """
+    await setup_integration_from_fixtures(hass, music_assistant_client)
+    entity_id = "media_player.test_group_player_1"
+    mass_player_id = "test_group_player_1"
+    player = music_assistant_client.players._players[mass_player_id]
+    queue = music_assistant_client.player_queues._queues[mass_player_id]
+    previous_image_url = "http://mass.local:8095/imageproxy/previous?size=512&fmt=png"
+    player.current_media = PlayerMedia(
+        uri=player.current_media.uri,
+        media_type=MediaType.TRACK,
+        title="November Rain",
+        artist="Guns N' Roses",
+        album="Use Your Illusion I",
+        image_url=previous_image_url,
+    )
+    await trigger_subscription_callback(
+        hass, music_assistant_client, EventType.PLAYER_UPDATED, mass_player_id
+    )
+    state = hass.states.get(entity_id)
+    assert state
+    assert state.attributes["media_title"] == "November Rain"
+    assert state.attributes["entity_picture"] == previous_image_url
+
+    # the queue moves to the next item; the player has not been updated yet
+    queue.current_index += 1
+    queue.current_item = next_item
+    await trigger_subscription_callback(
+        hass, music_assistant_client, EventType.QUEUE_UPDATED, mass_player_id
+    )
+    state = hass.states.get(entity_id)
+    assert state
+    assert state.attributes["media_title"] == "November Rain"
+    assert state.attributes["entity_picture"] == previous_image_url
+
+    # the player catches up with the queue
+    player.current_media = next_media
+    await trigger_subscription_callback(
+        hass, music_assistant_client, EventType.PLAYER_UPDATED, mass_player_id
+    )
+    state = hass.states.get(entity_id)
+    assert state
+    assert state.attributes["media_title"] == next_media.title
+    assert state.attributes["media_artist"] == next_media.artist
+    assert state.attributes["media_album_name"] == next_media.album
+    assert state.attributes["entity_picture"] == NEXT_ITEM_IMAGE_URL
